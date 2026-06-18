@@ -49,6 +49,10 @@ deny:
   - ".cache/**"
   - "tmp/**"
   - "temp/**"
+  - ".DS_Store"
+  - "**/.DS_Store"
+  - "Thumbs.db"
+  - "**/Thumbs.db"
 
   # Environment files and secret material
   - ".env*"

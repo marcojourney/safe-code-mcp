@@ -4,6 +4,7 @@ import { Injectable, OnModuleInit } from "@nestjs/common";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { minimatch } from "minimatch";
 import { audit } from "./audit.ts";
 import { loadPolicy, safeRelPath } from "./policy.ts";
 import { redact } from "./redact.ts";
@@ -45,6 +46,88 @@ export class McpService implements OnModuleInit {
     }
   }
 
+  // Resolve a repository-relative path without applying allow rules.
+  private resolveInsideRepo(inputPath = "."): { rel: string; abs: string } {
+    const normalized = inputPath.replaceAll("\\", "/").replace(/^\/+/, "") || ".";
+    const abs = path.resolve(this.policy.repoRoot, normalized);
+
+    if (abs !== this.policy.repoRoot && !abs.startsWith(this.policy.repoRoot + path.sep)) {
+      throw new Error("Path escapes repo root");
+    }
+
+    this.assertInsideRepo(abs);
+
+    return {
+      rel: path.relative(this.policy.repoRoot, abs).replaceAll("\\", "/") || ".",
+      abs,
+    };
+  }
+
+  private isDenied(rel: string): boolean {
+    if (rel === ".") return false;
+
+    return this.policy.deny.some(
+      (pattern) =>
+        minimatch(rel, pattern, { dot: true }) ||
+        minimatch(`${rel}/__entry__`, pattern, { dot: true })
+    );
+  }
+
+  private hasAllowedFileUnder(dir: string): boolean {
+    for (const item of fs.readdirSync(dir)) {
+      const abs = path.join(dir, item);
+      const rel = path.relative(this.policy.repoRoot, abs).replaceAll("\\", "/");
+      const stat = fs.lstatSync(abs);
+
+      if (stat.isSymbolicLink() || this.isDenied(rel)) continue;
+
+      if (stat.isDirectory() && this.hasAllowedFileUnder(abs)) return true;
+
+      if (stat.isFile()) {
+        try {
+          safeRelPath(this.policy, rel);
+          return true;
+        } catch {
+          continue;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  private readAllowedRange(
+    filePath: string,
+    startLine: number,
+    endLine: number
+  ): { rel: string; text: string; endLine: number; redactions: number; totalLines: number } {
+    if (endLine < startLine) {
+      throw new Error("endLine must be greater than or equal to startLine");
+    }
+
+    const rel = safeRelPath(this.policy, filePath);
+    const abs = path.join(this.policy.repoRoot, rel);
+    this.assertInsideRepo(abs);
+
+    const stat = fs.statSync(abs);
+    if (!stat.isFile()) {
+      throw new Error(`Not a file: ${rel}`);
+    }
+
+    const maxEnd = Math.min(endLine, startLine + this.policy.maxReadLines - 1);
+    const lines = fs.readFileSync(abs, "utf8").split(/\r?\n/);
+    const selected = lines.slice(startLine - 1, maxEnd).join("\n");
+    const result = redact(selected);
+
+    return {
+      rel,
+      text: result.text,
+      endLine: maxEnd,
+      redactions: result.redactions,
+      totalLines: lines.length,
+    };
+  }
+
   // Recursively list files that pass the allow/deny policy and skip symlinks.
   private walk(dir: string): string[] {
     const results: string[] = [];
@@ -53,17 +136,18 @@ export class McpService implements OnModuleInit {
       const abs = path.join(dir, item);
       const rel = path.relative(this.policy.repoRoot, abs).replaceAll("\\", "/");
 
-      try {
-        safeRelPath(this.policy, rel);
-      } catch {
-        continue;
-      }
-
       const stat = fs.lstatSync(abs);
-      if (stat.isSymbolicLink()) continue;
+      if (stat.isSymbolicLink() || this.isDenied(rel)) continue;
 
       if (stat.isDirectory()) results.push(...this.walk(abs));
-      else results.push(rel);
+      else {
+        try {
+          safeRelPath(this.policy, rel);
+          results.push(rel);
+        } catch {
+          continue;
+        }
+      }
     }
 
     return results;
@@ -85,8 +169,120 @@ export class McpService implements OnModuleInit {
       };
     });
 
+    // Return the active policy so clients can understand access boundaries.
+    this.server.tool("get_policy", {}, async () => {
+      const summary = {
+        repoRoot: this.policy.repoRoot,
+        allow: this.policy.allow,
+        deny: this.policy.deny,
+        maxReadLines: this.policy.maxReadLines,
+        auditLog: this.policy.auditLog,
+      };
+
+      this.audit({
+        tool: "get_policy",
+        allowRules: this.policy.allow.length,
+        denyRules: this.policy.deny.length,
+      });
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(summary, null, 2) }],
+      };
+    });
+
+    // List immediate visible children under a directory without returning file contents.
     this.server.tool(
-      // Read a bounded line range from an allowed file after redacting secrets.
+      "list_directory",
+      {
+        dirPath: z.string().default("."),
+      },
+      async ({ dirPath }) => {
+        const { rel, abs } = this.resolveInsideRepo(dirPath);
+        const stat = fs.statSync(abs);
+
+        if (!stat.isDirectory()) {
+          throw new Error(`Not a directory: ${rel}`);
+        }
+
+        if (this.isDenied(rel)) {
+          throw new Error(`Denied by policy: ${rel}`);
+        }
+
+        const entries = fs
+          .readdirSync(abs)
+          .map((name) => {
+            const entryAbs = path.join(abs, name);
+            const entryRel = path
+              .relative(this.policy.repoRoot, entryAbs)
+              .replaceAll("\\", "/");
+            const entryStat = fs.lstatSync(entryAbs);
+
+            if (entryStat.isSymbolicLink() || this.isDenied(entryRel)) return null;
+
+            if (entryStat.isDirectory()) {
+              if (!this.hasAllowedFileUnder(entryAbs)) return null;
+              return `${entryRel}/`;
+            }
+
+            try {
+              safeRelPath(this.policy, entryRel);
+              return entryRel;
+            } catch {
+              return null;
+            }
+          })
+          .filter((entry): entry is string => entry !== null)
+          .sort();
+
+        this.audit({
+          tool: "list_directory",
+          dir: rel,
+          count: entries.length,
+        });
+
+        return {
+          content: [{ type: "text", text: entries.join("\n") }],
+        };
+      }
+    );
+
+    // Return basic metadata for an allowed file without reading its contents.
+    this.server.tool(
+      "file_info",
+      {
+        filePath: z.string(),
+      },
+      async ({ filePath }) => {
+        const rel = safeRelPath(this.policy, filePath);
+        const abs = path.join(this.policy.repoRoot, rel);
+        this.assertInsideRepo(abs);
+
+        const stat = fs.statSync(abs);
+        if (!stat.isFile()) {
+          throw new Error(`Not a file: ${rel}`);
+        }
+
+        const lineCount = fs.readFileSync(abs, "utf8").split(/\r?\n/).length;
+        const info = {
+          filePath: rel,
+          sizeBytes: stat.size,
+          lineCount,
+          modifiedAt: stat.mtime.toISOString(),
+        };
+
+        this.audit({
+          tool: "file_info",
+          file: rel,
+        });
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(info, null, 2) }],
+        };
+      }
+    );
+
+    // Read a bounded line range from an allowed file after redacting secrets.
+    this.server.tool(
       "read_file",
       {
         filePath: z.string(),
@@ -94,21 +290,13 @@ export class McpService implements OnModuleInit {
         endLine: z.number().int().min(1).default(250),
       },
       async ({ filePath, startLine, endLine }) => {
-        const rel = safeRelPath(this.policy, filePath);
-        const abs = path.join(this.policy.repoRoot, rel);
-        this.assertInsideRepo(abs);
-
-        const maxEnd = Math.min(endLine, startLine + this.policy.maxReadLines - 1);
-        const lines = fs.readFileSync(abs, "utf8").split(/\r?\n/);
-        const selected = lines.slice(startLine - 1, maxEnd).join("\n");
-
-        const result = redact(selected);
+        const result = this.readAllowedRange(filePath, startLine, endLine);
 
         this.audit({
           tool: "read_file",
-          file: rel,
+          file: result.rel,
           startLine,
-          endLine: maxEnd,
+          endLine: result.endLine,
           redactions: result.redactions,
         });
 
@@ -118,8 +306,44 @@ export class McpService implements OnModuleInit {
       }
     );
 
+    // Read a context window around a target line.
     this.server.tool(
-      // Search allowed files for a literal query and redact sensitive matches.
+      "read_file_context",
+      {
+        filePath: z.string(),
+        line: z.number().int().min(1),
+        contextLines: z.number().int().min(0).max(100).default(20),
+      },
+      async ({ filePath, line, contextLines }) => {
+        const startLine = Math.max(1, line - contextLines);
+        const endLine = line + contextLines;
+        const result = this.readAllowedRange(filePath, startLine, endLine);
+
+        this.audit({
+          tool: "read_file_context",
+          file: result.rel,
+          line,
+          startLine,
+          endLine: result.endLine,
+          redactions: result.redactions,
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `File: ${result.rel}\n` +
+                `Lines: ${startLine}-${result.endLine} of ${result.totalLines}\n\n` +
+                result.text,
+            },
+          ],
+        };
+      }
+    );
+
+    // Search allowed files for a literal query and redact sensitive matches.
+    this.server.tool(
       "search_code",
       {
         query: z.string().min(2),
@@ -156,8 +380,8 @@ export class McpService implements OnModuleInit {
       }
     );
 
+    // Accept a patch proposal, scan it for secrets, and return it for manual review.
     this.server.tool(
-      // Accept a patch proposal, scan it for secrets, and return it for manual review.
       "propose_patch",
       {
         filePath: z.string(),

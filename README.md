@@ -11,7 +11,7 @@ flowchart TD
     Client["Codex CLI or MCP client"]
     Transport["stdio transport"]
     Server["safe-code-mcp<br/>NestJS + MCP SDK"]
-    Tools["MCP tools<br/>list/read/search/propose"]
+    Tools["MCP tools<br/>policy/list/read/search/propose"]
     Policy["policy.yml<br/>allow + deny rules"]
     Guard["path validation<br/>repo boundary check"]
     Redact["redaction scanner"]
@@ -34,7 +34,11 @@ flowchart TD
 | Tool | Purpose | Inputs |
 | --- | --- | --- |
 | `list_allowed_files` | Lists files visible under the configured policy. | none |
+| `get_policy` | Returns the active allow/deny policy, read limits, and audit path. | none |
+| `list_directory` | Lists immediate visible children under a directory without returning file contents. | `dirPath` |
+| `file_info` | Returns metadata for an allowed file without reading its contents. | `filePath` |
 | `read_file` | Reads a bounded line range from an allowed file and redacts obvious secrets. | `filePath`, `startLine`, `endLine` |
+| `read_file_context` | Reads a redacted context window around a target line. | `filePath`, `line`, `contextLines` |
 | `search_code` | Searches allowed files for a literal query and redacts matching lines. | `query` |
 | `propose_patch` | Accepts a patch proposal, scans it for secrets, and returns it for manual review. | `filePath`, `diff` |
 
@@ -77,6 +81,7 @@ The current policy denies sensitive or noisy paths, including:
 - `.env*` and nested environment files
 - private keys, certificates, keystores, GPG files, and credential paths
 - `.git/**`, `node_modules/**`, `dist/**`, build output, caches, and coverage
+- OS metadata files such as `.DS_Store` and `Thumbs.db`
 - logs, audit evidence, database dumps, backups, exports, spreadsheets, SQL files, and data files
 - production configuration paths
 - customer, card, payment, and regulated sample data directories
@@ -173,6 +178,30 @@ Read the first 25 lines of a source file:
     "filePath": "src/main.ts",
     "startLine": 1,
     "endLine": 25
+  }
+}
+```
+
+Read context around a specific line:
+
+```json
+{
+  "name": "read_file_context",
+  "arguments": {
+    "filePath": "src/mcp.service.ts",
+    "line": 120,
+    "contextLines": 20
+  }
+}
+```
+
+Get file metadata without reading content:
+
+```json
+{
+  "name": "file_info",
+  "arguments": {
+    "filePath": "src/mcp.service.ts"
   }
 }
 ```
