@@ -1,0 +1,26 @@
+{
+  "type": "module",
+  "scripts": {
+    "build": "nest build",
+    "dev": "nest start --watch",
+    "start": "nest start",
+    "start:dev": "nest start --watch",
+    "start:prod": "node dist/main.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@nestjs/common": "^11.1.26",
+    "@nestjs/core": "^11.1.26",
+    "minimatch": "^10.2.5",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^11.0.23",
+    "@types/node": "^25.9.3",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  }
+}
